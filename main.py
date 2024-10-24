@@ -1,7 +1,7 @@
 """
-Author: lvjianing
-Email: 1046016768@qq.com
-Date: June 22, 2024
+Author: lvjianing, xiguajerry
+Email: 1046016768@qq.com, 307356251@qq.com
+Date: Oct. 24, 2024
 """
 
 import torch
