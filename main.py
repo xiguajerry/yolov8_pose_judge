@@ -7,6 +7,7 @@ Date: June 22, 2024
 import torch
 import cv2 as cv
 import numpy as np
+import ultralytics.engine.results
 from ultralytics.data.augment import LetterBox
 from ultralytics.utils import ops
 from ultralytics.engine.results import Results
@@ -84,26 +85,28 @@ class YOLOv8Pose:
         cv.imshow('plotted_img', plotted_img)
         cv.waitKey(0)
         cv.destroyAllWindows()
-    
-    import math
 
     def determine_pose(self, keypoints):
         """
         通过关键点判断人体的姿态
         :param keypoints: 关键点坐标和置信度，格式为 [(x1, y1, conf1), (x2, y2, conf2), ...]
-        :return: 姿态类别： 'stand'（站立）, 'walk'（行走）, 'jump'（跳跃）, 'unknown'（未知）
+        :return: 姿态类别： 'stand'（站立）, 'walk'（行走）, 'jump'（跳跃）, 'lie' (趴倒), 'unknown'（未知）
         """
         # 如果关键点数量少于17个，直接返回'unknown'
         if len(keypoints) < 17:
             return 'unknown'
 
         # 定义一些关键点的索引
+        left_shoulder = keypoints[5]
+        right_shoulder = keypoints[6]
         left_ankle = keypoints[15]   # 左脚踝
         right_ankle = keypoints[16]  # 右脚踝
         left_knee = keypoints[13]    # 左膝盖
         right_knee = keypoints[14]   # 右膝盖
         left_hip = keypoints[11]     # 左髋关节
         right_hip = keypoints[12]    # 右髋关节
+        left_feet = keypoints[15]
+        right_feet = keypoints[16]
 
         # 获取关键点的坐标和置信度
         left_ankle_x, left_ankle_y, left_ankle_conf = left_ankle
@@ -130,10 +133,24 @@ class YOLOv8Pose:
             angle_rad = math.acos(cos_theta)
             angle_deg = math.degrees(angle_rad)
             return angle_deg
+            
+        def calculate_ascent(a, b):
+            return math.degrees(math.asin((a[1] - b[1]) / math.hypot(a[0] - b[0], a[1] - b[1])))
 
         # 简单的姿态判断逻辑
         if left_ankle_conf > 0.5 and right_ankle_conf > 0.5:
             # 在 OpenCV 坐标系中，y 坐标值越大，位置越低
+
+            shoulder_angle_left = calculate_knee_angle(left_shoulder, left_hip, left_knee)
+            shoulder_ascent_left = calculate_ascent(left_shoulder, left_feet)
+
+            shoulder_angle_right = calculate_knee_angle(right_shoulder, right_hip, right_knee)
+            shoulder_ascent_right = calculate_ascent(right_shoulder, right_feet)
+
+            # print(shoulder_angle_left)
+            # print(shoulder_ascent_left)
+            # print(shoulder_angle_right)
+            # print(shoulder_ascent_right)
 
             # 计算左脚角度
             knee_angle_left = calculate_knee_angle(left_knee, left_hip, left_ankle)
@@ -167,36 +184,48 @@ class YOLOv8Pose:
             if left_ankle_y > left_hip_y and right_ankle_y > right_hip_y:
                 if knee_angle_left > 60 or knee_angle_right > 60:  # 设置角度阈值为160度
                     return '跳跃'
+                
+            if shoulder_angle_left > 170 and shoulder_angle_right > 170 \
+                and shoulder_ascent_left < 30 and shoulder_ascent_right < 30:
+                return "趴倒"
         
         # 如果以上条件都不满足，返回'unknown'
         return '未知'
 
 
     def get_results_as_dicts(self, results):
+        print("results:", len(results))
         results_list = []
         for result in results:
+            # 准备关键点信息
+            keypoints = []
+            if result.keypoints.has_visible:
+                for kpt in result.keypoints.data:
+                    for point in kpt:
+                        x, y, conf = point.tolist()
+                        keypoints.append((x, y, conf))
+
+            if not result.boxes.data: return None
+
+            if len(keypoints) % len(result.boxes.data) != 0:
+                return None
             for i, box in enumerate(result.boxes.data):
+                print(1)
                 cls_id = result.boxes.cls[i].item()       # 获取类别ID
                 class_name = result.names.get(cls_id)
                 confidence = result.boxes.conf[i].item()  # 获取置信度
                 bbox = box[:4].tolist()                   # 获取边框坐标
-
-                # 准备关键点信息
-                keypoints = []
-                if result.keypoints.has_visible:
-                    for kpt in result.keypoints.data:
-                        for point in kpt:
-                            x, y, conf = point.tolist()
-                            keypoints.append((x, y, conf))
-
+                
+                kpts = keypoints[i * 17:(i + 1) * 17]
                 # 判断姿态
-                pose = self.determine_pose(keypoints)
+                pose = self.determine_pose(kpts)
+                # print("len:", len(keypoints))
 
                 result_dict = {
                     "class_name": class_name,
                     "boxes": bbox,
                     "confidence": confidence,
-                    "keypoints": keypoints,
+                    "keypoints": kpts,
                     "pose": pose  # 增加姿态信息
                 }
                 results_list.append(result_dict)
@@ -205,7 +234,7 @@ class YOLOv8Pose:
 
 # 关键点的连接关系（COCO数据集的例子）
 skeleton = [
-    (0, 1), (0, 2), (1, 3), (2, 4),(3, 5),(4, 6),              # 头部到身体
+    (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6),            # 头部到身体
     (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),                   # 身体到手臂
     (5, 11), (6, 12), (11, 12),                                # 躯干
     (11, 13), (12, 14), (13, 15), (14, 16)                     # 躯干到腿
@@ -251,7 +280,7 @@ def draw_results(image, results):
         pose_label = f"姿态: {res['pose']}"
         # cv.putText(image, pose_label, (start_point[0], start_point[1] - 30), cv.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), line_thickness)
 
-        image=draw_chinese_text(image, pose_label, (50, 50), "./STSONG.TTF", 48, (0, 255, 0))
+        image=draw_chinese_text(image, pose_label, start_point, "./STSONG.TTF", 48, (0, 255, 0))
 
     return image
 
@@ -313,14 +342,16 @@ def draw_chinese_text(image, text, position, font_path, font_size, color):
 
 if __name__ == "__main__":
     yolov8 = YOLOv8Pose(model_path='yolov8n-pose.pt', device='cpu', conf=0.25, iou=0.7)
-    imgs = ['images/stand.png', 'images/walk.png', 'images/tiao.png']  # 图片路径列表，这里假设有三张图片
+    imgs = ['images/stand.png', 'images/walk.png', 'images/tiao.png', 'images/lie.jpg', 'images/2.jpg', 'images/3.jpg', 'images/4.jpg']  # 图片路径列表，这里假设有三张图片
     processed_images = []                         # 存储处理后的图片结果
 
     # 处理每张图片并存储结果
     for img_path in imgs:
+        print("------------------------------", img_path)
         img = cv.imread(img_path)
         results = yolov8.detect(img_path)
         results_ = yolov8.get_results_as_dicts(results)
+        print(list(map(lambda r: r["pose"], results_)))
         img_with_results = draw_results(img, results_)
         processed_images.append(img_with_results)
 
